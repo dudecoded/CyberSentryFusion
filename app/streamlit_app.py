@@ -15,6 +15,7 @@ import json
 import joblib
 import xgboost as xgb
 from pathlib import Path
+from datetime import datetime
 
 st.set_page_config(page_title="CyberSentryFusion", page_icon="🛡️", layout="wide")
 
@@ -642,3 +643,351 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# INTERACTIVE ATTACK SIMULATOR
+# --------------------------------------------------
+
+if "sim_prediction_history" not in st.session_state:
+    st.session_state.sim_prediction_history = []
+
+st.divider()
+st.markdown('<div class="section-title">Interactive Attack Simulator</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-subtitle">Choose a traffic preset, inspect its feature values, and run the same trained XGBoost model.</div>',
+    unsafe_allow_html=True,
+)
+
+if not model_loaded or preprocessor is None or classifier is None:
+    st.error("The model is unavailable. Check the model files and logs.")
+else:
+    input_features = list(preprocessor.feature_names_in_)
+    categorical_features = ["proto", "service", "state"]
+    numeric_features = [name for name in input_features if name not in categorical_features]
+
+    encoder = preprocessor.named_transformers_["cat"]
+    categories = {
+        name: list(values)
+        for name, values in zip(categorical_features, encoder.categories_)
+    }
+
+    defaults = {
+        "dur": 0.5, "spkts": 10, "dpkts": 8, "sbytes": 1000, "dbytes": 2000,
+        "rate": 20, "sttl": 64, "dttl": 64, "sload": 1000, "dload": 1000,
+        "sloss": 0, "dloss": 0, "sinpkt": 0.1, "dinpkt": 0.1, "sjit": 0,
+        "djit": 0, "swin": 0, "stcpb": 0, "dtcpb": 0, "dwin": 0, "tcprtt": 0,
+        "synack": 0, "ackdat": 0, "smean": 100, "dmean": 100, "trans_depth": 0,
+        "response_body_len": 0, "ct_srv_src": 1, "ct_state_ttl": 1, "ct_dst_ltm": 1,
+        "ct_src_dport_ltm": 1, "ct_dst_sport_ltm": 1, "ct_dst_src_ltm": 1,
+        "is_ftp_login": 0, "ct_ftp_cmd": 0, "ct_flw_http_mthd": 0, "ct_src_ltm": 1,
+        "ct_srv_dst": 1, "is_sm_ips_ports": 0,
+    }
+
+    # These are illustrative feature presets, not verified samples from UNSW-NB15.
+    # The model's actual prediction is always calculated from the loaded artifacts.
+    presets = {
+        "Custom values": {
+            "categorical": {"proto": "tcp", "service": "-", "state": "CON"},
+            "numeric": {},
+        },
+        "Low-volume example": {
+            "categorical": {"proto": "tcp", "service": "-", "state": "CON"},
+            "numeric": {"dur": 1.0, "spkts": 4, "dpkts": 4, "sbytes": 300, "dbytes": 500,
+                        "rate": 2, "sload": 300, "dload": 500, "ct_srv_src": 1,
+                        "ct_src_ltm": 1, "ct_srv_dst": 1},
+        },
+        "High packet-volume example": {
+            "categorical": {"proto": "tcp", "service": "-", "state": "CON"},
+            "numeric": {"dur": 0.1, "spkts": 100, "dpkts": 2, "sbytes": 60000,
+                        "dbytes": 200, "rate": 1000, "sload": 600000, "dload": 2000,
+                        "ct_srv_src": 20, "ct_src_ltm": 15, "ct_srv_dst": 20,
+                        "ct_dst_src_ltm": 20},
+        },
+        "Connection-probing example": {
+            "categorical": {"proto": "tcp", "service": "-", "state": "INT"},
+            "numeric": {"dur": 0.01, "spkts": 2, "dpkts": 0, "sbytes": 120,
+                        "dbytes": 0, "rate": 200, "sload": 96000, "dload": 0,
+                        "ct_srv_src": 15, "ct_state_ttl": 2, "ct_dst_ltm": 12,
+                        "ct_src_dport_ltm": 12, "ct_dst_sport_ltm": 10,
+                        "ct_dst_src_ltm": 15, "ct_src_ltm": 12, "ct_srv_dst": 15},
+        },
+    }
+
+    # Restrict preset categorical choices to values the fitted encoder actually knows.
+    for preset in presets.values():
+        for feature, value in list(preset["categorical"].items()):
+            if value not in categories[feature]:
+                preset["categorical"][feature] = categories[feature][0]
+
+    def load_preset_values():
+        selected = presets[st.session_state.sim_preset]
+        for feature in categorical_features:
+            st.session_state[f"sim_{feature}"] = selected["categorical"].get(
+                feature, categories[feature][0]
+            )
+        values = {**defaults, **selected["numeric"]}
+        for feature in numeric_features:
+            st.session_state[f"sim_{feature}"] = float(values.get(feature, 0.0))
+
+    st.selectbox(
+        "Traffic preset",
+        options=list(presets.keys()),
+        key="sim_preset",
+        help="Presets are illustrative starting points. They are not guaranteed to represent real traffic or produce a particular class.",
+    )
+    if st.button("Load selected preset", key="load_sim_preset"):
+        load_preset_values()
+        st.rerun()
+
+    st.caption(
+        "Presets are illustrative feature combinations, not verified dataset records. "
+        "A preset's name does not determine the result; the trained model does."
+    )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.selectbox("Protocol", options=categories["proto"], key="sim_proto", index=0)
+    with col2:
+        st.selectbox("Service", options=categories["service"], key="sim_service", index=0)
+    with col3:
+        st.selectbox("Connection state", options=categories["state"], key="sim_state", index=0)
+
+    st.subheader("Numerical features")
+    st.caption("Adjust the 39 numerical features. Presets only change the starting values; you can edit any field.")
+    with st.expander("Adjust numerical values", expanded=False):
+        columns = st.columns(3)
+        for index, feature in enumerate(numeric_features):
+            key = f"sim_{feature}"
+            if key not in st.session_state:
+                st.session_state[key] = float(defaults.get(feature, 0.0))
+            with columns[index % 3]:
+                st.number_input(
+                    feature,
+                    value=float(st.session_state[key]),
+                    key=key,
+                    help=f"Input value for {feature}.",
+                )
+
+    st.info(
+        "This simulator classifies one feature record. It does not capture live packets, "
+        "and the output is not proof that traffic is malicious or safe."
+    )
+
+    if st.button("Predict traffic", type="primary", key="predict_sim_traffic"):
+        try:
+            record = {
+                "proto": st.session_state["sim_proto"],
+                "service": st.session_state["sim_service"],
+                "state": st.session_state["sim_state"],
+            }
+            record.update({feature: st.session_state[f"sim_{feature}"] for feature in numeric_features})
+            input_df = pd.DataFrame(
+                [[record[feature] for feature in input_features]],
+                columns=input_features,
+            )
+            processed = preprocessor.transform(input_df)
+            attack_probability = float(classifier.predict_proba(processed)[0, 1])
+            is_attack = attack_probability >= threshold
+
+            st.markdown("### Prediction result")
+            result_col, threshold_col = st.columns(2)
+            result_col.metric("Attack probability", f"{attack_probability:.2%}")
+            threshold_col.metric("Decision threshold", f"{threshold:.2%}")
+            st.progress(max(0.0, min(1.0, attack_probability)))
+            if is_attack:
+                st.error("⚠️ Predicted class: ATTACK")
+            else:
+                st.success("✅ Predicted class: NORMAL")
+            st.caption(
+                "The prediction is based on the entered feature values and the saved model. "
+                "The model is binary, so it does not identify a specific attack family."
+            )
+
+            # Keep the explanation available for the downloadable report.
+            shap_report_rows = []
+            # SHAP explanation for this individual prediction.
+            # SHAP values explain contributions to the model's raw output (log-odds),
+            # not direct percentage-point changes in the displayed attack probability.
+            st.markdown("### Why did the model make this prediction?")
+            try:
+                import shap
+                import plotly.express as px
+
+                with st.spinner("Calculating feature contributions..."):
+                    explainer = shap.TreeExplainer(classifier)
+                    shap_values = explainer.shap_values(processed)
+
+                    # Handle common SHAP output formats across SHAP versions.
+                    if isinstance(shap_values, list):
+                        row_values = np.asarray(shap_values[-1])[0]
+                    else:
+                        shap_array = np.asarray(shap_values)
+                        if shap_array.ndim == 3:
+                            row_values = shap_array[0, :, -1]
+                        elif shap_array.ndim == 2:
+                            row_values = shap_array[0]
+                        else:
+                            raise ValueError(
+                                f"Unexpected SHAP output shape: {shap_array.shape}"
+                            )
+
+                    try:
+                        transformed_names = list(preprocessor.get_feature_names_out())
+                    except Exception:
+                        transformed_names = [
+                            f"transformed_feature_{i}"
+                            for i in range(len(row_values))
+                        ]
+
+                    if len(transformed_names) != len(row_values):
+                        transformed_names = [
+                            f"transformed_feature_{i}"
+                            for i in range(len(row_values))
+                        ]
+
+                    explanation_df = pd.DataFrame({
+                        "Feature": transformed_names,
+                        "SHAP value": row_values,
+                    })
+                    explanation_df["Direction"] = np.where(
+                        explanation_df["SHAP value"] >= 0,
+                        "Pushes toward ATTACK",
+                        "Pushes toward NORMAL",
+                    )
+                    explanation_df["Absolute impact"] = explanation_df["SHAP value"].abs()
+                    top_features = (
+                        explanation_df.nlargest(10, "Absolute impact")
+                        .sort_values("SHAP value", ascending=True)
+                    )
+                    shap_report_rows = (
+                        explanation_df.nlargest(10, "Absolute impact")
+                        [["Feature", "SHAP value", "Direction"]]
+                        .to_dict(orient="records")
+                    )
+
+                    fig_shap = px.bar(
+                        top_features,
+                        x="SHAP value",
+                        y="Feature",
+                        color="Direction",
+                        orientation="h",
+                        color_discrete_map={
+                            "Pushes toward ATTACK": "#ff6b78",
+                            "Pushes toward NORMAL": "#37f5ce",
+                        },
+                        title="Top 10 feature contributions for this prediction",
+                    )
+                    fig_shap.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font_color="#dffcf5",
+                        xaxis_title="SHAP value (model-output contribution)",
+                        yaxis_title="",
+                        legend_title_text="Contribution direction",
+                        margin=dict(t=60, b=35, l=20, r=20),
+                    )
+                    st.plotly_chart(fig_shap, use_container_width=True)
+                    st.caption(
+                        "Positive SHAP values push the model output toward ATTACK; "
+                        "negative values push it toward NORMAL. These are model-output "
+                        "contributions, not proof of causation or percentage-point changes "
+                        "in attack probability. One-hot encoded categories may appear as "
+                        "transformed feature names."
+                    )
+            except Exception as shap_exc:
+                st.warning(
+                    "The prediction succeeded, but the SHAP explanation could not be "
+                    f"generated: {shap_exc}"
+                )
+
+            # Store a session-level snapshot for history, comparison, and export.
+            st.session_state.sim_prediction_history.append({
+                "run": len(st.session_state.sim_prediction_history) + 1,
+                "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "scenario": st.session_state.get("sim_preset", "Custom values"),
+                "prediction": "ATTACK" if is_attack else "NORMAL",
+                "attack_probability": attack_probability,
+                "threshold": threshold,
+                "protocol": record.get("proto"),
+                "service": record.get("service"),
+                "connection_state": record.get("state"),
+                "input_features_json": json.dumps(record, default=str),
+                "top_shap_features_json": json.dumps(shap_report_rows, default=str),
+            })
+            st.success("This prediction has been added to the session history.")
+        except Exception as exc:
+            st.error(f"Prediction failed: {exc}")
+
+# ============================================================
+# SIMULATION HISTORY, SCENARIO COMPARISON, AND REPORT EXPORT
+# ============================================================
+st.divider()
+st.markdown('<div class="section-title">Simulation History & Comparison</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-subtitle">Compare predictions from this session and export the results. History resets when the app session resets.</div>',
+    unsafe_allow_html=True,
+)
+
+history = st.session_state.get("sim_prediction_history", [])
+if not history:
+    st.info("No simulator predictions saved yet. Load a preset or adjust the fields, then click Predict traffic.")
+else:
+    history_df = pd.DataFrame(history)
+    display_columns = [
+        "run", "timestamp", "scenario", "prediction", "attack_probability",
+        "threshold", "protocol", "service", "connection_state"
+    ]
+    display_history = history_df[display_columns].copy()
+    display_history["attack_probability"] = (display_history["attack_probability"] * 100).round(2).astype(str) + "%"
+    display_history["threshold"] = (display_history["threshold"] * 100).round(2).astype(str) + "%"
+
+    st.subheader("1. Prediction history")
+    st.dataframe(display_history, use_container_width=True, hide_index=True)
+
+    st.subheader("2. Compare scenarios")
+    compare_df = history_df.copy()
+    compare_df["Run label"] = compare_df.apply(
+        lambda row: f"Run {int(row['run'])}: {row['scenario']}", axis=1
+    )
+    fig_compare = px.bar(
+        compare_df,
+        x="Run label",
+        y="attack_probability",
+        color="prediction",
+        text=compare_df["attack_probability"].map(lambda value: f"{value:.1%}"),
+        color_discrete_map={"NORMAL": "#37f5ce", "ATTACK": "#ff6b78"},
+        title="Attack probability by simulation",
+    )
+    fig_compare.add_hline(
+        y=threshold,
+        line_dash="dash",
+        line_color="#e9fffa",
+        annotation_text=f"Current threshold = {threshold:.0%}",
+    )
+    fig_compare.update_yaxes(tickformat=".0%", range=[0, 1])
+    fig_compare.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#dffcf5",
+        xaxis_title="Saved simulation",
+        yaxis_title="Attack probability",
+        margin=dict(t=60, b=70, l=20, r=20),
+    )
+    st.plotly_chart(fig_compare, use_container_width=True)
+
+    st.subheader("3. Exportable report")
+    report_csv = history_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇ Download simulation report (CSV)",
+        data=report_csv,
+        file_name="cybersentryfusion_simulation_report.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.caption(
+        "The report includes prediction history, probabilities, thresholds, scenario names, "
+        "the entered feature values (JSON), and top SHAP contributions when available. "
+        "It is a session report, not a live-network incident report."
+    )
+
+    if st.button("Clear simulator history", key="clear_sim_history"):
+        st.session_state.sim_prediction_history = []
+        st.rerun()
